@@ -44,16 +44,21 @@ Once everything is installed you can execute the following command to download a
 
 You can also use the following command line arguments with Caen Downloader. 
 ```bash
-./caenDownloader.py [-h] [--dir str] [--list] [--start int] [--stop int] [--verbose int]
+usage: caenDownloader.py [-h] [--dir str] [--listCourses] [--listRecordings] [--start int] [--stop int] [--threads int] [--verbose int]
 
-  -h, --help     show this help message and exit
-  --dir str      Specifies the directory to output downloaded recordings to. Default [str] = './recordings'
-  --list         Lists available courses to download Default = 'False'
-  --start int    Specifies the year to start parsing courses. Default [int] = '2006'
-  --stop int     Specifies the year to stop parsing courses. Default [int] = '2024'
-  --verbose int  Specifies the verbose level. Larger values enable more verbose output. Default [int] = '1'
+A lightweight python utility for downloading recorded CAEN lectures from the University of Michigan.
+
+options:
+  -h, --help        show this help message and exit
+  --dir str         Specifies the directory to output downloaded recordings to. Default [str] = './recordings'
+  --listCourses     Lists available courses to download and exits Default = 'False'
+  --listRecordings  Lists available recordings to download and exits Default = 'False'
+  --start int       Specifies the year to start parsing courses. Default [int] = '2006'
+  --stop int        Specifies the year to stop parsing courses. Default [int] = '2024'
+  --threads int     Specifies the number of threads to use while downloading. Default [int] = '12'
+  --verbose int     Specifies the verbose log level. Larger values enable more verbose output. Log Levels: {'Error': 0, 'Default': 1, 'Verbose': 2} Default [int] = '1'
 ```
-> Note: It may be a good ide to run `./caenDownloader.py --list` to see what courses are available before downloading so you can pick a good `--start` and `--stop` year and avoid downloading videos you don't need. 
+> Note: It may be a good ide to run `./caenDownloader.py --listCourses` and `./caenDownloader.py --listRecordings` to see what courses, videos, and total download sizes are before downloading so you can pick a good `--start` and `--stop` year and avoid downloading videos you don't need. 
 
 <br>
 
@@ -63,9 +68,8 @@ In no particular order:
 - Add support for filtering course name and recording titles with regex to only. (Example: only download videos that match "EECS*" courses or "Section 1")
 - Add an `--update` option that only downloads files if it doesn't already exist in output directory
 - Add support to download captions and convert them to a srt file saved alongside video
-- Ability support for downloading thumbnails
-- Add multi-threading support for parallel downloads
+- Add support for downloading thumbnails
+- Add support for downloading auxiliary whiteboard images
 - Figure out waveform.audiomap is used for and if it's useful
 - Add ability to download files from CAEN computer accounts 
-- Have `--list` report the number of bytes that will be downloaded
 

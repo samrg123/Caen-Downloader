@@ -56,7 +56,7 @@ class ArgParser(ArgumentParser):
     def Parse(self, args: ArgsT) -> ArgsT:
 
         argDict = args.ArgDict()
-        kwKeys = [field.name for field in fields(ArgParseArg) ]
+        kwKeys = [field.name for field in fields(ArgParseArg)]
 
         # invoke self.add_argument for each of our Arg fields
         for name, arg in argDict.items():

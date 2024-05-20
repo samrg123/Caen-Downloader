@@ -2,12 +2,21 @@ import traceback
 from datetime import datetime
 
 from typing import Final
+from dataclasses import dataclass, fields
 
-LOG_LEVEL_ERROR  : Final[int] = 0
-LOG_LEVEL_DEFAULT: Final[int] = 1
-LOG_LEVEL_VERBOSE: Final[int] = 2
+@dataclass
+class LogLevel:
+    Error  : Final[int] = 0
+    Default: Final[int] = 1
+    Verbose: Final[int] = 2
 
-gLogLevel:int = LOG_LEVEL_DEFAULT
+    @staticmethod
+    def getMapping() -> dict[str, int]:
+        """Returns a dict LogLevel fields to values sorted in ascending value order"""
+        mapping = {field.name: field.default for field in fields(LogLevel)}
+        return dict(sorted(mapping.items(), key=lambda item: item[1]))
+
+gLogLevel:int = LogLevel.Default
 
 def setLogLevel(level:int) -> int:
     """Sets gLogLevel to `level` and returns the previously set level"""
@@ -16,11 +25,11 @@ def setLogLevel(level:int) -> int:
     oldLevel = gLogLevel
     gLogLevel = level
 
-    log(f"Changed gLogLevel from '{oldLevel}' to '{gLogLevel}'", logLevel=LOG_LEVEL_VERBOSE)
+    log(f"Changed gLogLevel from '{oldLevel}' to '{gLogLevel}'", logLevel=LogLevel.Verbose)
 
     return oldLevel
 
-def log(msg, prefix:str="MSG", logLevel:int=LOG_LEVEL_DEFAULT) -> None:
+def log(msg, prefix:str="MSG", logLevel:int=LogLevel.Default) -> None:
 
     if gLogLevel >= logLevel:
 
@@ -32,12 +41,12 @@ def log(msg, prefix:str="MSG", logLevel:int=LOG_LEVEL_DEFAULT) -> None:
         print(msgStart + msgBody)
 
 def panic(msg) -> None:
-    log(msg, "PANIC", logLevel=LOG_LEVEL_ERROR)
+    log(msg, "PANIC", logLevel=LogLevel.Error)
     traceback.print_stack()
     exit(1)
 
 def warn(msg) -> None:
-    log(msg, prefix="WARN", logLevel=LOG_LEVEL_ERROR)
+    log(msg, prefix="WARN", logLevel=LogLevel.Error)
 
 def error(msg) -> None:
-    log(msg, prefix="ERROR", logLevel=LOG_LEVEL_ERROR)    
+    log(msg, prefix="ERROR", logLevel=LogLevel.Error)    

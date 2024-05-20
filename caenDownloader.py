@@ -1,20 +1,28 @@
+import concurrent
+import concurrent.futures
+from contextlib import redirect_stdout
+import dataclasses
 import html
+import json
 import os
 import re
-import time
-from typing import Final, Any, Type, TypeVar, Union, Dict
-
-import json
-from bs4 import BeautifulSoup
-
 import requests
+import sys
+import time
+import types
 import urllib.parse
 
+from bs4 import BeautifulSoup
+from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import copy
 from datetime import datetime, timedelta
 from pwinput import pwinput
+from typing import Final, Any, Type, TypeVar, Union, Dict, get_args, get_origin
 
-from utils.logging import *
 from utils.ArgParser import *
+from utils.logging import *
+from utils.ThreadedStdOut import *
 
 def inputListSelection(options:list, prompt:str = "Select an Option") -> int:
 
@@ -48,7 +56,46 @@ def inputListSelection(options:list, prompt:str = "Select an Option") -> int:
         print("-----\n")
 
 
+def humanReadableSize(size:int) -> str:
+    for suffix in ["bytes", "KB", "MB", "GB", "TB", "PB"]:
+        if size < 1024:
+            return f"{size:.3f} {suffix}"
+        size/= 1024 
+
 # TODO: pull out to parse util
+
+def parseType(value:str|type) -> type | None:
+
+    valueOrigin = get_origin(value)
+    valueType = type( valueOrigin if valueOrigin else value )
+
+    if valueType is type:
+        return value
+
+    if valueType is str:
+
+        # TODO!!! Add support for dynamically loading modules
+        # module, n = None, 0
+        # while n < len(parts):
+        #     nextmodule = safeimport('.'.join(parts[:n+1]), forceload)
+        #     if nextmodule: module, n = nextmodule, n + 1
+        #     else: break
+        # if module:
+        #     object = module
+        # else:
+        #     object = builtins
+
+        splitValue = [name for name in value.split('.')]        
+        result = sys.modules[__name__]
+        for name in splitValue:
+
+            result = getattr(result, name, None)
+            if result is None:
+                return None
+
+        return result
+
+    return None 
 
 class ParseException(Exception):
     def __init__(self, message:str) -> None:
@@ -61,24 +108,93 @@ KeyT   = TypeVar("KeyT"  )
 ValueT = TypeVar("ValueT")
 class ParsableDictionary(Dict[Type[KeyT], Type[ValueT]]):
 
+    ObjT = TypeVar("ObjT")
+    @staticmethod
+    def instantiateValue(value, ObjT:Type[ObjT]) -> Type[ObjT]:
+
+        if isinstance(value, dict):
+
+            if ObjT == ParsableDictionary:        
+                return ParsableDictionary(value)
+            
+            elif dataclasses.is_dataclass(ObjT):
+
+                try:
+                
+                    # parse fields to make sure everything initializes to correct type
+                    parsedArgs = {}
+                    for field in fields(ObjT):
+                        if field.name in value:
+                            parsedArgs[field.name] = ParsableDictionary.parseValue(value[field.name], parseType(field.type))
+
+                    return ObjT(**parsedArgs)
+                
+
+                except Exception as e:
+                    raise ParseException(f"Failed to instantiate '{ObjT}' dataclass from dictionary type '{type(value)}'. Exception: {e}")         
+
+        return None
+
+    ParseT = TypeVar("ParseT")
+    @staticmethod
+    def parseValue(value, ParseT:Type[ParseT]=Any) -> Type[ParseT]:
+
+        # Note: we return a copy of the value so modifying parsed data won't modify the original
+        if ParseT == Any:
+            return copy(value)
+
+        ParseTOrigin = get_origin(ParseT)
+        if ParseTOrigin in (Union, types.UnionType):
+            for argT in get_args(ParseT):
+                try:
+                    return ParsableDictionary.parseValue(value, argT)
+                except ParseException:
+                    pass
+            raise ParseException(f"Failed to parse value type '{type(value)}' as: '{ParseT}'. Value = '{value}' ")
+
+        # try to instantiate object 
+        instantiatedValue = ParsableDictionary.instantiate(value, ParseT)
+        if instantiatedValue is not None:
+            return instantiatedValue
+
+        # Note: Python doesn't support checking isinstance(x, 'origin[args...]') yet, so we strip off args 
+        ParseInstanceT = ParseTOrigin if ParseTOrigin else ParseT
+        if not isinstance(value, ParseInstanceT):
+            raise ParseException(f"Unexpected value type '{type(value)}'. Expected: '{ParseInstanceT}'")        
+        
+        if ParseTOrigin:
+            
+            # TODO: expand this to work with tuples, sets, and dicts
+            supportedTypes = [list]
+            if ParseTOrigin not in supportedTypes:
+                raise ParseException(f"Unsupported parameterized generic type '{ParseTOrigin}'. Expected one of: '{supportedTypes}'")
+
+            parseTArgs = get_args(ParseT)
+            assert len(parseTArgs) == 1
+            argT = parseType(parseTArgs[0])
+
+            # parse all our elements to match argT
+            return [ParsableDictionary.parseValue(v, argT) for v in value] 
+        
+        return copy(value)
+
+
     ParseT = TypeVar("ParseT")
     def parse(self, key, ParseT:Type[ParseT]=Any) -> Type[ParseT]:
 
         if key not in self:
             raise ParseException(f"Missing required '{key}' key in: '{self}'")
 
-        value = self[key]
-        if ParseT == Any:
-            return value
-
-        if not isinstance(value, ParseT):
-            raise ParseException(f"Unexpected '{key}' value type in: '{self}'. Got '{type(value)}', Expected: '{ParseT}'")        
-        
-        return value
-
+        return ParsableDictionary.parseValue(self[key], ParseT)
+    
+    
+    ObjT = TypeVar("ObjT")
+    def instantiate(self, ObjT:Type[ObjT]) -> Type[ObjT]:
+        return ParsableDictionary.instantiateValue(self, ObjT)
+         
     def __str__(self) -> str:
         return f"ParsableDictionary {{ {super().__str__()} }}"
-
+    
 
 def parseGetParams(url:str) -> ParsableDictionary:
     parsedUrl = urllib.parse.urlparse(url)
@@ -136,7 +252,7 @@ def parseSoupElementsByName(htmlSoup:BeautifulSoup, nameAttribute:str, requiredA
     return [parseSoup(elmt, requiredAttributes=requiredAttributes) for elmt in elements] 
 
 
-def parseHtmlElements(html:str, elementName:str, attrs:dict = {}, requiredAttributes:list[str] = []) -> BeautifulSoup:
+def parseHtmlElements(html:str, elementName:str, attrs:dict = {}, requiredAttributes:list[str] = []) -> list[BeautifulSoup]:
     return parseSoupElements(BeautifulSoup(html, 'html.parser'), elementName=elementName, attrs=attrs, requiredAttributes=requiredAttributes)
 
 def parseHtmlElement(html:str, elementName:str, attrs:dict = {}, requiredAttributes:list[str] = []) -> BeautifulSoup:
@@ -294,7 +410,7 @@ class DuoForm:
             return None
         
         apiResponseJson = parseJsonDict(apiResponse.text)
-        log(f"Duo api message | url: {url} | payload: {payload} | apiResponse: {apiResponseJson}", logLevel=LOG_LEVEL_VERBOSE)
+        log(f"Duo api message | url: {url} | payload: {payload} | apiResponse: {apiResponseJson}", logLevel=LogLevel.Verbose)
 
         apiResponseStat = apiResponseJson.parse("stat", str)
         if apiResponseStat.lower() != "ok":
@@ -305,7 +421,7 @@ class DuoForm:
 
         return ParsableDictionary(responseDict)
 
-    def login(self, session:requests.Session, maxLoginAttempts:int = 1) -> str|None:
+    def login(self, session:requests.Session, maxLoginAttempts:int = 1) -> str | None:
         """ 
             Returns the redirect url on success or None of failure 
             Note: This function will a throw a ParseException if it encounters malformed duo responses
@@ -464,7 +580,7 @@ class DebugSession(requests.Session):
     def debugRequest(self, method, url, **kwargs):
 
         response = super().request(method, url, **kwargs)
-        log(f"Request: {method} @ '{url}' | [ {kwargs.get('data')} ] -> '{response.url}'", logLevel=LOG_LEVEL_VERBOSE)
+        log(f"Request: {method} @ '{url}' | [ {kwargs.get('data')} ] -> '{response.url}'", logLevel=LogLevel.Verbose)
 
         return response
 
@@ -481,16 +597,145 @@ class CaenDownloader():
     kMaxYear: Final = datetime.now().year
 
     kLeccapBaseUrl: Final = "https://leccap.engin.umich.edu/leccap/"
-    kRelativeApiUrl: Final = "player/api/product"
+    kApiUrl: Final = "https://leccap.engin.umich.edu/leccap/player/api/product/"
 
-    kDefaultSanitizeSymbol:Final = ""
+    kDefaultSanitizeSymbol: Final = ""
+    kDownloadChunkSize: Final = 1*1024*1024 
 
-    _loggedIn:bool = False
+    loggedIn:bool = False
+    
+    # Note: marking dataclass as eq and frozen enables hashing
+    @dataclass(eq=True, frozen=True)
+    class CourseAnchor:
+        year: int
+        text: str
+        href: str
 
-    def __init__(self) -> None:
-        self.session = DebugSession() 
+    @dataclass(eq=True, frozen=True)
+    class Recording():
+        url: str
+        title: str
+        date: str
+        timestamp: int
+        fileUnder: str | None
+        description: str | None
+        captions: bool
 
-    def login(self, maxLoginAttempts:int = 3) -> bool:
+
+    @dataclass(eq=True, frozen=True)
+    class RecordingProduct():
+        movie_exported_video_layout: str
+        audio_waveform_image: str | None
+        grind_time_total: str
+        movie_length_as_recorded: str
+        audio_detect_end: str | None
+        audio_detected: str | None
+        movie_exported_width: str
+        movie_exported_slides_present: str
+        force_lecture_copy_complete: str
+        slides_folder: str
+        movie_exported_duration: str
+        movie_exported_video_left: str
+        movie_exported_video_width: str
+        grinder_version: int
+        movie_exported_filesize: str
+        product_total_filesize: str
+        movie_type: str
+        preservation_movie_name: str | None
+        grinder_build: int
+        movie_exported_name: str
+        audio_waveform_map: str
+        movie_exported_video_top: str
+        grinder_sha_short: str
+        movie_exported_audio_bitrate_kbps: str
+        movie_exported_height: str
+        audio_detect_start: str | None
+        movie_exported_video_height: str
+        audio_length: str | None
+        movie_exported_video_present: str
+        slide_count: str | None
+        movie_exported_visual_bitrate_kbps: str
+        has_content_motion: str
+        thumbnail_count: str | None
+        movie_exported_slides_left: str | None
+        movie_exported_slides_width: str | None
+        movie_exported_slides_height: str | None
+        movie_exported_slides_top: str | None
+        used_content_motion: str | None
+        used_movie_visual_bitrate_fallback: str | None
+        viewer_name: str
+        codec_id: int
+        codec_order: int
+        codec_description: str
+        raw_total_filesize: str | None = None
+        preservation_slides_size: str | None = None
+        movie_audio_channel_count: str | None = None
+
+    @dataclass(eq=True, frozen=True)
+    class RecordingCaption():
+        text: str
+        intime: float | int
+        outtime: float | int
+
+    @dataclass(eq=True, frozen=True)
+    class RecordingAuxSource():
+        kind: str
+        prefix: str
+        name: str
+        thumbnails: list[list[int]]
+        images: list[list[str | int]]
+        width: str
+        height: str
+        folder: str
+        thumbWidth: int
+        thumbHeight: int
+
+    @dataclass(eq=True, frozen=True)
+    class RecordingProductInfo():
+        products: list["CaenDownloader.RecordingProduct"]
+        aux_sources: list["CaenDownloader.RecordingAuxSource"] | None
+        captions: list["CaenDownloader.RecordingCaption"] | str
+        cid: int
+        words: list[str]
+        words_reviewed: bool
+        thumbnails_folder: str | None = None
+        thumbnails: list[list[int]] | None = None
+
+    @dataclass(eq=True, frozen=True)
+    class RecordingInfo():
+        id: int
+        title: str
+        date: str
+        sitekey: str
+        sitename: str
+        orgLogo: str | None
+        enable_playlist: int
+        show_site_title: int
+        recordingkey: str
+        description: str
+        statsURL: str
+        error: str | None
+        published: bool
+        sendPostInterval: int
+        canManage: bool
+        viewerUID: str
+        mediaPrefix: str
+        info: "CaenDownloader.RecordingProductInfo"
+
+        def __post_init__(self) -> None:
+            numRecordingProducts = len(self.info.products)
+            if numRecordingProducts != 1:
+                raise CaenDownloaderException(f"Expected 1 recording product for '{self.title}', got '{numRecordingProducts}'")
+
+        def getProduct(self) -> "CaenDownloader.RecordingProduct":
+            return self.info.products[0]
+
+    def __init__(self, numThreads:int) -> None:
+        self.session = DebugSession()
+        self.threadPool = ThreadPoolExecutor(max_workers=numThreads)
+        
+
+    def login(self, maxLoginAttempts:int = 3) -> None:
 
         for i in range(1, maxLoginAttempts+1):
 
@@ -537,33 +782,107 @@ class CaenDownloader():
             samlResponse = HtmlForm.parseResponse(response, requiredInputs=["SAMLResponse"])
             response = samlResponse.submit(self.session)
 
-            self._loggedIn = True 
-            return True
+            self.loggedIn = True
+            return 
 
-        return False
+        raise CaenDownloaderException(f"Failed to login")
+    
+    
+    def getCourseAnchors(self, year) -> list[CourseAnchor]:
 
-    def getCourseAnchors(self, startYear:int, stopYear:int) -> list[BeautifulSoup]:
+        if year < CaenDownloader.kMinYear or year > CaenDownloader.kMaxYear:
+            raise CaenDownloaderException(f"Invalid course year '{year}'. Valid Range [{CaenDownloader.kMinYear}, {CaenDownloader.kMaxYear}]") 
 
-        if startYear < CaenDownloader.kMinYear:
-            warn(f"Invalid startYear: {startYear}, clamping to {CaenDownloader.kMinYear}")
-            startYear = CaenDownloader.kMinYear 
+        url = urllib.parse.urljoin(CaenDownloader.kLeccapBaseUrl, str(year))
+        response = self.session.get(url)
+        
+        anchorSoups = parseHtmlElements(response.text, "a", attrs={"class": "list-group-item"}, requiredAttributes=["href"])
+        anchors = [ 
+            CaenDownloader.CourseAnchor(
+                year = year,
+                text = soup.text,
+                href = soup.attrs["href"]
+            ) 
+            for soup in anchorSoups 
+        ]
 
-        if stopYear > CaenDownloader.kMaxYear:
-            warn(f"Invalid stopYear: {stopYear}, clamping to {CaenDownloader.kMaxYear}")
-            stopYear = CaenDownloader.kMaxYear
+        return anchors
 
-        if not self._loggedIn and not self.login():
-            raise CaenDownloaderException(f"Failed to login")
+    def getRecordings(self, courseAnchor:CourseAnchor) -> list[Recording]:
 
-        courses = []
-        for year in range(startYear, stopYear+1):
+        # fetch download page
+        recordingsUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, courseAnchor.href) 
+        response = self.session.get(recordingsUrl)
+        
+        # parse recordings javascript variable 
+        decodedHtml = response.text.replace("\\u0026", "&").replace("\\u0023", "#") 
+        unescapedHtml = html.unescape(decodedHtml)
+        recordingsMatch = re.search(R"var\s+recordings\s*=\s*(\[(?:(?!]\s*;)(?:.|\n))*\])", unescapedHtml)
+        if recordingsMatch is None:
+            raise CaenDownloaderException(f"Failed to parse recordings from pageHtml")
 
-            url = urllib.parse.urljoin(self.kLeccapBaseUrl, str(year))
-            response = self.session.get(url)
+        recordingsJsonStr = recordingsMatch.group(1)
+        recordingsJsonList = parseJsonList(recordingsJsonStr)
 
-            courses+= parseHtmlElements(response.text, "a", attrs={"class": "list-group-item"}, requiredAttributes=["href"])
+        recordings = []
+        for recordingDict in recordingsJsonList: 
 
-        return courses
+            # parse recording struct
+            recording = recordingDict.instantiate(CaenDownloader.Recording)
+            recordings.append(recording)
+
+        return recordings
+
+    def getRecordingInfo(self, recording:Recording) -> RecordingInfo:
+
+        # parse recording key
+        splitRecordingUrl = recording.url.split("/")
+        if len(splitRecordingUrl) == 0:
+            raise CaenDownloaderException(f"Failed to extract video key from recording url '{recording.url}'")
+        
+        recordingKey = splitRecordingUrl[-1]
+
+        # request recording information
+        apiResponse = self.session.get(CaenDownloader.kApiUrl, params={"rk": recordingKey})
+        apiResponseJson = parseJsonDict(apiResponse.text)
+
+        # parse recording information
+        recordingInfo = apiResponseJson.instantiate(CaenDownloader.RecordingInfo)
+        return recordingInfo
+
+
+    def getFutureCourseAnchors(self, startYear:int, stopYear:int) -> dict[int, Future[list[CourseAnchor]]]: 
+
+        futureAnchors = {
+            year: self.threadPool.submit(self.getCourseAnchors, year)
+            for year in range(startYear, stopYear+1)       
+        }
+
+        return futureAnchors
+
+
+    def getFutureRecordings(self, futureCourseAnchors:Iterable[Future[list[CourseAnchor]]]) -> dict[CourseAnchor, Future[list[Recording]]]:
+
+        futureRecordings = {}
+        for future in concurrent.futures.as_completed(futureCourseAnchors):
+
+            courseAnchors = future.result()
+            for courseAnchor in courseAnchors:
+                futureRecordings[courseAnchor] = self.threadPool.submit(self.getRecordings, courseAnchor) 
+
+        return futureRecordings
+
+    def getFutureRecordingsInfo(self, futureRecordings:Iterable[Future[list[Recording]]]) -> dict[Recording, Future[RecordingInfo]]:
+
+        futureRecordingsInfo = {}
+        for future in concurrent.futures.as_completed(futureRecordings):
+
+            recordings = future.result()
+            for recording in recordings:
+                futureRecordingsInfo[recording] = self.threadPool.submit(self.getRecordingInfo, recording) 
+
+        return futureRecordingsInfo
+
 
     @staticmethod
     def sanitizeName(name:str) -> str:
@@ -598,117 +917,174 @@ class CaenDownloader():
         return sanitizedName
 
 
-    def downloadRecordings(self, pageHtml:str, dir:str) -> None:
+    def downloadRecording(self, recordingInfo:RecordingInfo, dir:str) -> None:
 
-        apiUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, self.kRelativeApiUrl)
+        product = recordingInfo.getProduct()
+        videoExtension = product.movie_type
 
-        # parse recordings javascript variable 
-        decodedHtml = pageHtml.encode().decode('unicode-escape')
-        unescapedHtml = html.unescape(decodedHtml)
-        recordingsMatch = re.search(r"var\s+recordings\s*=\s*([^;]*);", unescapedHtml)
-        if recordingsMatch is None:
-            raise CaenDownloaderException(f"Failed to parse recordings from pageHtml")
+        mediaUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, recordingInfo.mediaPrefix)
+        videoUrl = urllib.parse.urljoin(mediaUrl, f"{recordingInfo.sitekey}/{product.movie_exported_name}.{videoExtension}" )
 
-        recordingsJsonStr = recordingsMatch.group(1)
-        recordingsJsonList = parseJsonList(recordingsJsonStr)
+        videoSaveName = self.sanitizeName(f"{recordingInfo.date} - {recordingInfo.title}") + f".{videoExtension}"
+        videoSavePath = os.path.join(dir, videoSaveName)
 
-        for recordingDict in recordingsJsonList: 
+        # TODO: update flag to not download if files already exist 
+        if not os.path.exists(dir):
+            os.makedirs(dir)
+            log(f"Created dir: '{dir}'", logLevel=LogLevel.Verbose)            
 
-            # parse recording key
-            recordingUrl = recordingDict.parse("url", str)
-            splitRecordingUrl = recordingUrl.split("/")
 
-            if len(splitRecordingUrl) == 0:
-                raise CaenDownloaderException(f"Failed to extract video key from recording url '{recordingUrl}'")
+        videoBytes = int(product.movie_exported_filesize)
+        videoBytesHumanStr = humanReadableSize(videoBytes)
+        print(f"-> Downloading '{videoSavePath}' [{videoBytesHumanStr}]")
 
-            recordingKey = splitRecordingUrl[-1]
-            
-            # request recording information
-            apiResponse = self.session.get(apiUrl, params={"rk": recordingKey})
-            apiResponseJson = parseJsonDict(apiResponse.text)
+        response = self.session.get(videoUrl, stream=True)
+        response.raise_for_status()
 
-            # parse recording information
-            title = apiResponseJson.parse("title", str)
-            siteKey = apiResponseJson.parse("sitekey", str)
-            mediaPrefix = apiResponseJson.parse("mediaPrefix", str)
- 
-            info = ParsableDictionary(apiResponseJson.parse("info", dict))
-            products = info.parse("products", list)
+        with open(videoSavePath, "wb") as file:
+        
+            totalBytesWritten = 0
+            for chunk in response.iter_content(chunk_size=CaenDownloader.kDownloadChunkSize):
+                
+                chunkLen = len(chunk)
+                bytesWritten = file.write(chunk)
 
-            if len(products) != 1:
-                raise CaenDownloaderException(f"Expected 1 product for recording '{title}', got '{len(products)}'")
-            
-            product = ParsableDictionary(products[0])
+                if bytesWritten != chunkLen:
+                    raise CaenDownloaderException(f"Failed to write chunk to '{videoSavePath}'. chunkLen: '{chunkLen}', bytesWritten: '{bytesWritten}'")
 
-            videoName = product.parse("movie_exported_name", str)
-            videoExtension = product.parse("movie_type", str)
+                totalBytesWritten+= bytesWritten
 
-            mediaUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, mediaPrefix)
-            videoUrl = urllib.parse.urljoin(mediaUrl, f"{siteKey}/{videoName}.{videoExtension}" )
-
-            # download video
-            videoSaveName = self.sanitizeName(title) + f".{videoExtension}"
-            videoSavePath = os.path.join(dir, videoSaveName)
-            print(f"-> Downloading '{videoSavePath}'")
-
-            # TODO: is there a way to just stream this to disk?... would save a lot of ram and speed up debugger
-            videoResponse = self.session.get(videoUrl)
-            if videoResponse.status_code != 200:
-                warn(f"Failed to download '{videoUrl}'. Expected status code 200, got '{videoResponse.status_code}'")
-                continue
-
-            # write video to disk
-            if not os.path.exists(dir):
-                os.makedirs(dir)
-                log(f"Created dir: '{dir}'", logLevel=LOG_LEVEL_VERBOSE)            
-
-            with open(videoSavePath, "wb") as file:
-                file.write(videoResponse.content)
-
+                percentComplete = totalBytesWritten / videoBytes 
+                print(f"--> '{videoSavePath}': {100*percentComplete:.3f}% [{humanReadableSize(totalBytesWritten)} / {videoBytesHumanStr} ]")
 
     def downloadCourses(self, startYear:int, stopYear:int, dir:str) -> None:
+        
+        stdOutHeader = f"--- Downloading recordings from '{startYear}' to '{stopYear}' (this may take some time) ---"
+        with redirect_stdout(ThreadedStdOut(header=stdOutHeader)):
 
-        courseAnchors = self.getCourseAnchors(startYear=startYear, stopYear=stopYear)
-        for courseAnchor in courseAnchors:
-            
-            saveDir = os.path.join(dir, self.sanitizeName(courseAnchor.text))
-            print(f"Downloading recordings for '{courseAnchor.text}':")
+            futureCourseAnchors = self.getFutureCourseAnchors(startYear=startYear, stopYear=stopYear)
+            futureRecordings = self.getFutureRecordings(futureCourseAnchors.values())
 
-            courseHref:str = courseAnchor.attrs["href"]
-            recordingsUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, courseHref) 
+            def downloadThread(recording:CaenDownloader.Recording, saveDir:str) -> None:
+                print(f"Waiting on recording info for: '{saveDir}'")
+                recordingInfo = self.getRecordingInfo(recording)
 
-            response = self.session.get(recordingsUrl)
-            self.downloadRecordings(response.text, saveDir)
+                self.downloadRecording(recordingInfo, saveDir)
+                print(f"Done downloading to '{saveDir}'")
+
+            downloadFutures = []
+            for year, courseAnchorsFuture in futureCourseAnchors.items():
+
+                print(f"Status: Getting courses for '{year}'")
+                courseAnchors = courseAnchorsFuture.result()
+                for courseAnchor in courseAnchors:
+    
+                    saveDir = os.path.normpath(os.path.join(dir, str(year), self.sanitizeName(courseAnchor.text)))
+                    
+                    print(f"Status: Getting recordings for '{saveDir}'")
+                    recordings = futureRecordings[courseAnchor].result()
+                    for recording in recordings:
+                        downloadFuture = self.threadPool.submit(downloadThread, recording, saveDir)
+                        downloadFutures.append(downloadFuture)
+
+                print(f"Status: Waiting for download threads to finish...")
+                concurrent.futures.wait(downloadFutures)
 
     def listCourses(self, startYear:int, stopYear:int) -> None:
         
-        courseAnchors = self.getCourseAnchors(startYear=startYear, stopYear=stopYear)
+        print(f"--- Listing courses from '{startYear}' to '{stopYear}' (this may take some time) ---")
+        
+        futureCourseAnchors = self.getFutureCourseAnchors(startYear=startYear, stopYear=stopYear)
+        
+        totalCourses = 0
+        for year, future in futureCourseAnchors.items():
+            
+            courseAnchors = future.result()
+            numCourses = len(courseAnchors) 
+            
+            # skip over blank years
+            if numCourses == 0:
+                continue
 
-        print(f"Courses from {startYear} - {stopYear}:")
-        for courseAnchor in courseAnchors:
-            print(f"\t{courseAnchor.text}")
+            print(f"{year}:")           
+            for courseAnchor in courseAnchors:
+                print(f"\t{courseAnchor.text}")    
+            
+            totalCourses+= numCourses
+        
+        print(f"\n--- {totalCourses} courses listed ---\n")
+
+    def listRecordings(self, startYear:int, stopYear:int) -> None:
+
+        print(f"--- Listing recordings from '{startYear}' to '{stopYear}' (this may take some time) ---")        
+        
+        futureCourseAnchors = self.getFutureCourseAnchors(startYear=startYear, stopYear=stopYear)
+        futureRecordings = self.getFutureRecordings(futureCourseAnchors.values())
+        futureRecordingsInfo = self.getFutureRecordingsInfo(futureRecordings.values())
+
+        totalRecordings = 0
+        totalRecordingsBytes = 0
+
+        for year, future in futureCourseAnchors.items():
+            courseAnchors = future.result()
+
+            # skip over empty years
+            if len(courseAnchors) == 0:
+                continue
+
+            print(f"{year}:")
+
+            numCourseRecordings = 0
+            numCourseRecordingsBytes = 0
+            for courseAnchor in courseAnchors:
+                print(f"\t{courseAnchor.text}:") 
+
+                recordings = futureRecordings[courseAnchor].result()
+                
+                numRecordings = len(recordings)
+                numRecordingsBytes = 0
+                for recording in recordings:
+
+                    recordingInfo = futureRecordingsInfo[recording].result()
+                    recordingProduct = recordingInfo.getProduct()
+                    recordingBytes = int(recordingProduct.movie_exported_filesize)
+                    
+                    print(f"\t\t{recording.title} [Recorded {recording.date} | {humanReadableSize(recordingBytes)}]")    
+
+                    numRecordingsBytes+= recordingBytes
+
+                print(f"\t\t--- {numRecordings} recordings [{humanReadableSize(numRecordingsBytes)}] ---\n")    
+
+                numCourseRecordings+= numRecordings
+                numCourseRecordingsBytes+= numRecordingsBytes 
+
+            print(f"\t--- {numCourseRecordings} course recordings [{humanReadableSize(numCourseRecordingsBytes)}] ---\n")    
+            totalRecordings+= numCourseRecordings
+            totalRecordingsBytes+= numCourseRecordingsBytes
 
 
-    def getRecordingIds(self, startYear:int, stopYear:int) -> None:
-        pass
+        print(f"\n--- Total {totalRecordings} recordings listed [{humanReadableSize(totalRecordingsBytes)}] ---\n")
+
+
 
 def main():
     
     # TODO: Add support for matching course name and/or recording titles with regex
-    # TODO: have --update option that only downloads files if it doesn't already exist in output directory
     # TODO: add ability to download captions if available and convert the to srt file saved alongside video
     # TODO: add ability to download thumbnails? why would we want this
     # TODO: figure out waveform.audiomap is used for ... just looks like a binary blob
-    # TODO: add multi-threading support for faster downloads
-    class MainArgs(Args):
-        dir     = Arg(longName="--dir",     metavar="str",  type=str,   default="./recordings",            help=f"Specifies the directory to output downloaded recordings to.")
-        start   = Arg(longName="--start",   metavar="int",  type=int,   default=CaenDownloader.kMinYear, help=f"Specifies the year to start parsing courses.")
-        stop    = Arg(longName="--stop",    metavar="int",  type=int,   default=datetime.today().year,   help=f"Specifies the year to stop parsing courses.")
-        verbose = Arg(longName="--verbose", metavar="int",  type=int,   default=LOG_LEVEL_DEFAULT,       help=f"Specifies the verbose level. Larger values enable more verbose output.")
-        list    = Arg(longName="--list",    action="store_true",        default=False,                   help=f"Lists available courses to download")
+    # TODO: have --update option that only downloads files if it doesn't already exist in output directory
+
+    class MainArgs(Args):        
+        dir            = Arg(longName="--dir",              metavar="str",  type=str,   default="./recordings",          help=f"Specifies the directory to output downloaded recordings to.")
+        listCourses    = Arg(longName="--listCourses",      action="store_true",        default=False,                   help=f"Lists available courses to download and exits")
+        listRecordings = Arg(longName="--listRecordings",   action="store_true",        default=False,                   help=f"Lists available recordings to download and exits")
+        start          = Arg(longName="--start",            metavar="int",  type=int,   default=CaenDownloader.kMinYear, help=f"Specifies the year to start parsing courses.")
+        stop           = Arg(longName="--stop",             metavar="int",  type=int,   default=datetime.today().year,   help=f"Specifies the year to stop parsing courses.")
+        threads        = Arg(longName="--threads",          metavar="int",  type=int,   default=min(12, os.cpu_count()), help=f"Specifies the number of threads to use while downloading.")
+        verbose        = Arg(longName="--verbose",          metavar="int",  type=int,   default=LogLevel.Default,        help=f"Specifies the verbose log level. Larger values enable more verbose output. Log Levels: {LogLevel.getMapping()}")
 
     argParser = ArgParser(
-        prog = "Caen Downloader",
         description = "A lightweight python utility for downloading recorded CAEN lectures from the University of Michigan."        
     )
 
@@ -717,23 +1093,45 @@ def main():
     setLogLevel(args.verbose.value)
 
     argStr = "\n".join([f"\t{name} [{type(arg.value)}] = '{arg.value}'" for name, arg in args.ArgDict().items()])
-    log(f"Using args: {{\n{argStr}\n}}", logLevel=LOG_LEVEL_VERBOSE)
+    log(f"Using args: {{\n{argStr}\n}}", logLevel=LogLevel.Verbose)
 
-    dirPath   = args.dir.value
-    startYear = args.start.value
-    stopYear  = args.stop.value
+    dirPath    = args.dir.value
+    startYear  = args.start.value
+    stopYear   = args.stop.value
+    numThreads = args.threads.value
 
-    caenDownloader = CaenDownloader()
-    if args.list.value:
+    if numThreads < 1:
+        warn(f"Invalid numThreads '{numThreads}'. Clamping numThreads to 1")
+        numThreads = 1
 
+    if startYear < CaenDownloader.kMinYear:
+        warn(f"Invalid startYear: {startYear}, clamping to {CaenDownloader.kMinYear}")
+        startYear = CaenDownloader.kMinYear 
+
+    if stopYear > CaenDownloader.kMaxYear:
+        warn(f"Invalid stopYear: {stopYear}, clamping to {CaenDownloader.kMaxYear}")
+        stopYear = CaenDownloader.kMaxYear    
+
+    caenDownloader = CaenDownloader(numThreads=numThreads)
+    caenDownloader.login()
+    
+    if args.listCourses.value:
+
+        if args.listRecordings.value:
+            warn(f"Ignoring '{args.listRecordings.longName}'")
+        
         caenDownloader.listCourses(startYear=startYear, stopYear=stopYear)
+        exit()
 
-    else:
-        caenDownloader.downloadCourses(
-            startYear = startYear, 
-            stopYear  = stopYear,
-            dir       = dirPath,
-        )
+    if args.listRecordings.value:
+        caenDownloader.listRecordings(startYear=startYear, stopYear=stopYear)
+        exit()
+
+    caenDownloader.downloadCourses(
+        startYear = startYear, 
+        stopYear  = stopYear,
+        dir       = dirPath,
+    )
 
 if __name__ == "__main__":
     main()
