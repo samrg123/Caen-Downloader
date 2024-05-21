@@ -370,22 +370,29 @@ class Leccap():
         return sanitizedName
 
 
-    def downloadRecording(self, recordingInfo:RecordingInfo, dir:str) -> None:
+    def downloadRecording(self, recording:Recording, recordingInfo:RecordingInfo, dir:str) -> None:
 
         product = recordingInfo.getProduct()
+
         videoExtension = product.movie_type
+        recordingDate = datetime.fromtimestamp(recording.timestamp)
+        
+        videoName = f"{recordingDate.strftime('%Y-%m-%d [%H-%M-%S]')} - " + self.sanitizeName(f"{recordingInfo.title} ({recordingInfo.recordingkey})")
+        videoSavePath = os.path.join(dir, f"{videoName}.{videoExtension}")
+
+        if not os.path.exists(dir):
+            os.makedirs(dir)
+            log(f"Created dir: '{dir}'", logLevel=LogLevel.Verbose)
+
+        else:
+            # make sure we get a unique save name so we don't overwrite an existing videos
+            videoSaveIndex = 0
+            while os.path.exists(videoSavePath):            
+                videoSaveIndex+= 1
+                videoSavePath = os.path.join(dir, f"{videoName}_{videoSaveIndex}.{videoExtension}")
 
         mediaUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, recordingInfo.mediaPrefix)
         videoUrl = urllib.parse.urljoin(mediaUrl, f"{recordingInfo.sitekey}/{product.movie_exported_name}.{videoExtension}" )
-
-        videoSaveName = self.sanitizeName(f"{recordingInfo.date} - {recordingInfo.title}") + f".{videoExtension}"
-        videoSavePath = os.path.join(dir, videoSaveName)
-
-        # TODO: update flag to not download if files already exist 
-        if not os.path.exists(dir):
-            os.makedirs(dir)
-            log(f"Created dir: '{dir}'", logLevel=LogLevel.Verbose)            
-
 
         videoBytes = int(product.movie_exported_filesize)
         videoBytesHumanStr = parseHumanReadableSize(videoBytes)
@@ -422,7 +429,7 @@ class Leccap():
                 print(f"Waiting on recording info for: '{saveDir}'")
                 recordingInfo = self.getRecordingInfo(recording)
 
-                self.downloadRecording(recordingInfo, saveDir)
+                self.downloadRecording(recording, recordingInfo, saveDir)
                 print(f"Done downloading to '{saveDir}'")
 
             downloadFutures = []
