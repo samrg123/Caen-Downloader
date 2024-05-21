@@ -21,7 +21,7 @@
             "args": [
                 // "--verbose", "0", "--listRecordings"
                 // "--verbose", "0", "--listCourses"
-                "--verbose", "0", "--start=2021", "--stop=2021"
+                "--verbose", "0", "--start=2018", "--stop=2018", "--threads=8"
             ]
         }
     ]

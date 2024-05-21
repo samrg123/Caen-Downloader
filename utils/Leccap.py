@@ -61,6 +61,9 @@ class Leccap():
         description: str | None
         captions: bool
 
+        def getKey(self) -> str:
+            keyIndex = self.url.rfind("/") + 1
+            return self.url[keyIndex:]
 
     @dataclass(eq=True, frozen=True)
     class RecordingProduct():
@@ -169,6 +172,21 @@ class Leccap():
 
         def getProduct(self) -> "Leccap.RecordingProduct":
             return self.info.products[0]
+
+        def getVideoExtension(self) -> str:
+            return self.getProduct().movie_type
+
+        def getVideoSize(self) -> int:
+            return int(self.getProduct().movie_exported_filesize)
+
+        def getVideoUrl(self) -> str:
+            product = self.getProduct()
+            videoExtension = product.movie_type
+            
+            mediaUrl = urllib.parse.urljoin(Leccap.kLeccapBaseUrl, self.mediaPrefix)
+            videoUrl = urllib.parse.urljoin(mediaUrl, f"{self.sitekey}/{product.movie_exported_name}.{videoExtension}" )
+            return videoUrl
+        
 
     class DebugSession(requests.Session):
         def __init__(self) -> None:
@@ -288,15 +306,8 @@ class Leccap():
 
     def getRecordingInfo(self, recording:Recording) -> RecordingInfo:
 
-        # parse recording key
-        splitRecordingUrl = recording.url.split("/")
-        if len(splitRecordingUrl) == 0:
-            raise LeccapException(f"Failed to extract video key from recording url '{recording.url}'")
-        
-        recordingKey = splitRecordingUrl[-1]
-
         # request recording information
-        apiResponse = self.session.get(Leccap.kApiUrl, params={"rk": recordingKey})
+        apiResponse = self.session.get(Leccap.kApiUrl, params={"rk": recording.getKey()})
         apiResponseJson = parseJsonDict(apiResponse.text)
 
         # parse recording information
@@ -370,38 +381,21 @@ class Leccap():
         return sanitizedName
 
 
-    def downloadRecording(self, recording:Recording, recordingInfo:RecordingInfo, dir:str) -> None:
-
-        product = recordingInfo.getProduct()
-
-        videoExtension = product.movie_type
-        recordingDate = datetime.fromtimestamp(recording.timestamp)
+    def downloadRecording(self, recordingInfo:RecordingInfo, savePath:str) -> None:
         
-        videoName = f"{recordingDate.strftime('%Y-%m-%d [%H-%M-%S]')} - " + self.sanitizeName(f"{recordingInfo.title} ({recordingInfo.recordingkey})")
-        videoSavePath = os.path.join(dir, f"{videoName}.{videoExtension}")
-
-        if not os.path.exists(dir):
-            os.makedirs(dir)
-            log(f"Created dir: '{dir}'", logLevel=LogLevel.Verbose)
-
-        else:
-            # make sure we get a unique save name so we don't overwrite an existing videos
-            videoSaveIndex = 0
-            while os.path.exists(videoSavePath):            
-                videoSaveIndex+= 1
-                videoSavePath = os.path.join(dir, f"{videoName}_{videoSaveIndex}.{videoExtension}")
-
-        mediaUrl = urllib.parse.urljoin(self.kLeccapBaseUrl, recordingInfo.mediaPrefix)
-        videoUrl = urllib.parse.urljoin(mediaUrl, f"{recordingInfo.sitekey}/{product.movie_exported_name}.{videoExtension}" )
-
-        videoBytes = int(product.movie_exported_filesize)
+        videoUrl = recordingInfo.getVideoUrl()
+        videoBytes = recordingInfo.getVideoSize()
         videoBytesHumanStr = parseHumanReadableSize(videoBytes)
-        print(f"-> Downloading '{videoSavePath}' [{videoBytesHumanStr}]")
+
+        print(f"-> Downloading '{savePath}' [{videoBytesHumanStr}]")
 
         response = self.session.get(videoUrl, stream=True)
         response.raise_for_status()
 
-        with open(videoSavePath, "wb") as file:
+        if os.path.exists(savePath):
+            warn(f"Overwriting existing file: '{savePath}'")
+
+        with open(savePath, "wb") as file:
         
             totalBytesWritten = 0
             for chunk in response.iter_content(chunk_size=Leccap.kDownloadChunkSize):
@@ -410,27 +404,30 @@ class Leccap():
                 bytesWritten = file.write(chunk)
 
                 if bytesWritten != chunkLen:
-                    raise LeccapException(f"Failed to write chunk to '{videoSavePath}'. chunkLen: '{chunkLen}', bytesWritten: '{bytesWritten}'")
+                    raise LeccapException(f"Failed to write chunk to '{savePath}'. chunkLen: '{chunkLen}', bytesWritten: '{bytesWritten}'")
 
                 totalBytesWritten+= bytesWritten
 
                 percentComplete = totalBytesWritten / videoBytes 
-                print(f"--> '{videoSavePath}': {100*percentComplete:.3f}% [{parseHumanReadableSize(totalBytesWritten)} / {videoBytesHumanStr} ]")
+                print(f"--> '{savePath}': {100*percentComplete:.3f}% [{parseHumanReadableSize(totalBytesWritten)} / {videoBytesHumanStr} ]")
 
     def downloadCourses(self, startYear:int, stopYear:int, dir:str) -> None:
-        
+
+        def downloadThread(recording:Leccap.Recording, videoSaveDir:str, videoSaveName:str) -> None:
+
+            print(f"Getting recording info for: '{videoSaveName}'")
+            recordingInfo = self.getRecordingInfo(recording)
+
+            videoSavePath = os.path.join(videoSaveDir, f"{videoSaveName}.{recordingInfo.getVideoExtension()}")
+            self.downloadRecording(recordingInfo, videoSavePath)
+            
+            print(f"Done downloading '{videoSavePath}'")
+
         stdOutHeader = f"--- Downloading recordings from '{startYear}' to '{stopYear}' (this may take some time) ---"
         with redirect_stdout(ThreadedStdOut(header=stdOutHeader)):
 
             futureCourseAnchors = self.getFutureCourseAnchors(startYear=startYear, stopYear=stopYear)
             futureRecordings = self.getFutureRecordings(futureCourseAnchors.values())
-
-            def downloadThread(recording:Leccap.Recording, saveDir:str) -> None:
-                print(f"Waiting on recording info for: '{saveDir}'")
-                recordingInfo = self.getRecordingInfo(recording)
-
-                self.downloadRecording(recording, recordingInfo, saveDir)
-                print(f"Done downloading to '{saveDir}'")
 
             downloadFutures = []
             for year, courseAnchorsFuture in futureCourseAnchors.items():
@@ -439,16 +436,34 @@ class Leccap():
                 courseAnchors = courseAnchorsFuture.result()
                 for courseAnchor in courseAnchors:
     
-                    saveDir = os.path.normpath(os.path.join(dir, str(year), self.sanitizeName(courseAnchor.text)))
-                    
-                    print(f"Status: Getting recordings for '{saveDir}'")
+                    # get directory to save recordings to
+                    videoSaveDir = os.path.normpath(os.path.join(dir, str(year), self.sanitizeName(courseAnchor.text)))
+                    if not os.path.exists(videoSaveDir):
+                            os.makedirs(videoSaveDir)
+                            log(f"Created dir: '{videoSaveDir}'", logLevel=LogLevel.Verbose)
+
+                    print(f"Status: Getting recordings for '{videoSaveDir}'")
                     recordings = futureRecordings[courseAnchor].result()
+                    videoSaveNames = set()
                     for recording in recordings:
-                        downloadFuture = self.threadPool.submit(downloadThread, recording, saveDir)
+
+                        recordingDate = datetime.fromtimestamp(recording.timestamp)
+                        videoName = f"{recordingDate.strftime('%Y-%m-%d [%H-%M-%S]')} - " + self.sanitizeName(f"{recording.title} ({recording.getKey()})")
+
+                        # get unique video name to save
+                        videoSaveIndex = 0
+                        videoSaveName = videoName
+                        while videoSaveName in videoSaveNames:
+                            videoSaveIndex+= 1
+                            videoSaveName = f"{videoName}_{videoSaveIndex}"
+
+                        downloadFuture = self.threadPool.submit(downloadThread, recording=recording, videoSaveDir=videoSaveDir, videoSaveName=videoSaveName)
                         downloadFutures.append(downloadFuture)
 
+            # Note: we call future.result on everything to propagate any exceptions to the main thread
             print(f"Status: Waiting for download threads to finish...")
-            concurrent.futures.wait(downloadFutures)
+            for future in concurrent.futures.as_completed(downloadFutures):
+                future.result()
 
     def listCourses(self, startYear:int, stopYear:int) -> None:
         
