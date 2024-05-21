@@ -4,11 +4,10 @@ import io
 import threading
 
 from collections.abc import Iterable
-from typing import Final
 
 class ThreadedStdOut:
 
-    _globalBuffers : dict[int, io.StringIO] = {}
+    _globalBuffers: dict[int, io.StringIO] = {}
     _globalBuffersLock = threading.Lock()
 
     class BufferReference():
