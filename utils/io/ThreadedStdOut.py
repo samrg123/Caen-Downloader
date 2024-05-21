@@ -57,6 +57,7 @@ class ThreadedStdOut:
     def __init__(self, header:str = "", stdout = sys.stdout) -> None:
         self.header = header
         self.stdout = stdout
+        self._update()
 
     def _update(self) -> None:
         numTermCols, numTermLines = os.get_terminal_size()
