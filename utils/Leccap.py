@@ -447,8 +447,8 @@ class Leccap():
                         downloadFuture = self.threadPool.submit(downloadThread, recording, saveDir)
                         downloadFutures.append(downloadFuture)
 
-                print(f"Status: Waiting for download threads to finish...")
-                concurrent.futures.wait(downloadFutures)
+            print(f"Status: Waiting for download threads to finish...")
+            concurrent.futures.wait(downloadFutures)
 
     def listCourses(self, startYear:int, stopYear:int) -> None:
         
