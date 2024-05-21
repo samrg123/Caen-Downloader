@@ -19,7 +19,7 @@ This project was originally developed for bulk downloading of lectures for archi
 As it stands there are a handful of todo's and feature's I may get around to implementing if have the time, but the project is in a 'good enough' state to use as of now. Let me know if you'd like me to add any new features or maintain the project and I'd be happy to do so!
 
 An example screenshot of a recorded lecture video
-![Screenshot](resources/exampleVideoScreenshot.png)
+![Screenshot](.resources/exampleVideoScreenshot.png)
 
 <br>
 
